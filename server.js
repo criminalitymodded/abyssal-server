@@ -2,8 +2,13 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const accounts = require('./accounts');
 
 const app = express();
+app.set('trust proxy', 1);
+app.use((req, res, next) => { res.set('Access-Control-Allow-Origin', '*'); res.set('Access-Control-Allow-Headers', 'content-type, authorization'); res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS'); if (req.method === 'OPTIONS') return res.sendStatus(204); next(); });
+const onlineNames = new Map(); // lowercase name -> socket id
+app.use('/api', accounts.router((lc) => onlineNames.has(lc)));
 app.get('/', (_req, res) => res.send('ABYSSAL server online'));
 app.get('/health', (_req, res) => res.json({ ok: true, lobbies: lobbies.size }));
 
@@ -12,7 +17,6 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 const MAX_PLAYERS = 4;
 const lobbies = new Map(); // code -> {code,name,isPrivate,host,players:Map(id->{id,name,x,y,z,ry})}
-const NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 
 function code() {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -25,7 +29,7 @@ function publicList() {
 }
 function lobbyState(l) {
   return { code: l.code, name: l.name, isPrivate: l.isPrivate, host: l.host, started: !!l.started,
-    players: [...l.players.values()].map(p => ({ id: p.id, name: p.name, ready: !!p.ready })) };
+    players: [...l.players.values()].map(p => ({ id: p.id, name: p.name, role: p.role, ready: !!p.ready })) };
 }
 function leave(socket) {
   const c = socket.data.lobby; if (!c) return;
@@ -41,9 +45,29 @@ function leave(socket) {
 io.on('connection', (socket) => {
   socket.emit('lobby:list', publicList());
 
-  socket.on('hello', ({ name } = {}, cb) => {
-    if (!NAME_RE.test(name || '')) return cb && cb({ error: 'Bad name' });
-    socket.data.name = name; cb && cb({ ok: true, id: socket.id });
+  // hello: {token} for account players, or {name} for guests. Names are unique.
+  socket.on('hello', async ({ name, token } = {}, cb) => {
+    try {
+      let role = 'guest', n;
+      if (token) {
+        const p = await accounts.fromToken(token);
+        if (!p) return cb && cb({ error: 'Please log in again.' });
+        n = p.username; role = p.role;
+      } else {
+        n = String(name || '');
+        const bad = accounts.validName(n); if (bad) return cb && cb({ error: bad });
+        const db = accounts.pool();
+        if (db) { const { rows } = await db.query('SELECT 1 FROM players WHERE username_lc=$1', [n.toLowerCase()]); if (rows.length) return cb && cb({ error: 'That name belongs to an account. Log in or pick another.' }); }
+      }
+      const lc = n.toLowerCase(), holder = onlineNames.get(lc);
+      if (holder && holder !== socket.id) {
+        if (role === 'guest') return cb && cb({ error: 'That name is in use right now.' });
+        const old = io.sockets.sockets.get(holder); if (old) old.disconnect(true); // same account signed in elsewhere
+      }
+      if (socket.data.name) onlineNames.delete(socket.data.name.toLowerCase());
+      onlineNames.set(lc, socket.id); socket.data.name = n; socket.data.role = role;
+      cb && cb({ ok: true, id: socket.id, name: n, role });
+    } catch (e) { console.error(e); cb && cb({ error: 'Server error' }); }
   });
   socket.on('lobby:list', (_ = {}, cb) => cb && cb(publicList()));
 
@@ -62,7 +86,7 @@ io.on('connection', (socket) => {
     leave(socket); join(socket, l, cb);
   });
   function join(sock, l, cb) {
-    l.players.set(sock.id, { id: sock.id, name: sock.data.name });
+    l.players.set(sock.id, { id: sock.id, name: sock.data.name, role: sock.data.role });
     sock.join(l.code); sock.data.lobby = l.code;
     sock.to(l.code).emit('player:joined', { id: sock.id, name: sock.data.name });
     io.to(l.code).emit('lobby:state', lobbyState(l));
@@ -87,7 +111,7 @@ io.on('connection', (socket) => {
   socket.on('event', (e) => { if (socket.data.lobby) socket.to(socket.data.lobby).emit('event', { id: socket.id, ...e }); });
   socket.on('chat', (msg) => {
     if (!socket.data.lobby) return;
-    io.to(socket.data.lobby).emit('chat', { id: socket.id, name: socket.data.name, text: String(msg || '').slice(0, 200) });
+    io.to(socket.data.lobby).emit('chat', { id: socket.id, name: socket.data.name, role: socket.data.role, text: String(msg || '').slice(0, 200) });
   });
 
   // WebRTC voice signaling (peer-to-peer audio, server only relays offers/answers/ICE)
@@ -96,8 +120,8 @@ io.on('connection', (socket) => {
     if (l && l.players.has(to)) io.to(to).emit('rtc:signal', { from: socket.id, data });
   });
 
-  socket.on('disconnect', () => leave(socket));
+  socket.on('disconnect', () => { leave(socket); if (socket.data.name && onlineNames.get(socket.data.name.toLowerCase()) === socket.id) onlineNames.delete(socket.data.name.toLowerCase()); });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('ABYSSAL server on ' + PORT));
+accounts.init().catch(e => console.error('DB init failed', e)).finally(() => server.listen(PORT, () => console.log('ABYSSAL server on ' + PORT)));
